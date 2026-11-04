@@ -48,11 +48,11 @@
  *  - ステアリング入力切替 : PS4コントローラーの△ボタン
  *  - PS4接続    : USB Host Shield 2.0 (SPI: D9〜D13)
  *  - Jetson操舵 : USBシリアル、115200bps、ASCII、LF (\n) 終端
- *  - Jetson形式 : S<0〜255> (例: S127\n)
+ *  - Jetson形式 : S<0〜255> (例: S127\n)。S<値>,T<値>形式も受信し、操舵値Sを使用
  *  - Jetson値   : 0〜255をステアリングパルス1200〜1800usに変換
- *  - Jetson無通信: Jetson操舵選択中に500ms受信がなければ中央に戻す
- *  - Arduino返送: S<最終操舵0〜255>,T<最終スロットル-255〜255>\n
- *  - 返送例     : S127,T-100 (Sonar回避・減速反映後の出力値)
+ *  - Jetson無通信: 最後に受信した操舵値を保持。まだ受信がなければ中央にする
+ *  - Arduino返送: Jetson操舵モードでは受信したS値をそのまま返し、
+ *                  Tには最終スロットル値(-255〜255)を返す
  * 
  * 【空きピン (I2Cデバイスや追加センサー等で利用可能)】
  *  - デジタル : D2 (外部割り込みINT0)
@@ -92,9 +92,8 @@ const int DEADZONE = 12;
 const float SIDE_WALL_SLOW_DISTANCE_CM = 80.0;
 const float SIDE_WALL_STOP_DISTANCE_CM = 20.0;
 const int SIDE_WALL_STEERING_CORRECTION_US = 150;
-const unsigned long COMMAND_TIMEOUT_MS = 500;
 const unsigned long TELEMETRY_INTERVAL_MS = 50;
-const uint8_t SERIAL_LINE_BUFFER_SIZE = 8;
+const uint8_t SERIAL_LINE_BUFFER_SIZE = 16;
 
 char serialLine[SERIAL_LINE_BUFFER_SIZE];
 uint8_t serialLineLength = 0;
@@ -103,7 +102,6 @@ bool serialLineOverflow = false;
 int jetsonSteeringValue = STEERING_INPUT_CENTER;
 bool hasJetsonSteeringCommand = false;
 bool useJetsonSteering = false;
-unsigned long lastJetsonSteeringCommandMs = 0;
 unsigned long lastTelemetryMs = 0;
 
 // ----------------------------------------------------------------------------
@@ -242,7 +240,8 @@ void loop() {
         if (serialLine[0] == 'S') {
           long steeringValue = strtol(serialLine + 1, &numberEnd, 10);
           bool steeringDigits = numberEnd != serialLine + 1 &&
-                                *numberEnd == '\0';
+                                (*numberEnd == '\0' ||
+                                 (numberEnd[0] == ',' && numberEnd[1] == 'T'));
           for (char *digit = serialLine + 1; digit < numberEnd; digit++) {
             if (*digit < '0' || *digit > '9') {
               steeringDigits = false;
@@ -250,12 +249,33 @@ void loop() {
             }
           }
 
-          if (steeringDigits &&
+          bool validLine = steeringDigits;
+          if (validLine && *numberEnd != '\0') {
+            char *throttleStart = numberEnd + 2;
+            char *throttleEnd;
+            long throttleValue = strtol(throttleStart, &throttleEnd, 10);
+            bool throttleDigits = throttleEnd != throttleStart;
+            char *digit = throttleStart;
+            if (*digit == '-') {
+              digit++;
+            }
+            for (; digit < throttleEnd; digit++) {
+              if (*digit < '0' || *digit > '9') {
+                throttleDigits = false;
+                break;
+              }
+            }
+            validLine = throttleDigits &&
+                        *throttleEnd == '\0' &&
+                        throttleValue >= -255 &&
+                        throttleValue <= 255;
+          }
+
+          if (validLine &&
               steeringValue >= STEERING_INPUT_MIN &&
               steeringValue <= STEERING_INPUT_MAX) {
             jetsonSteeringValue = steeringValue;
             hasJetsonSteeringCommand = true;
-            lastJetsonSteeringCommandMs = millis();
           }
         }
       }
@@ -290,6 +310,9 @@ void loop() {
         r2Val, 0, 255,
         ESC_STOP_US, ESC_STOP_US - ESC_FORWARD_LIMIT_RANGE_US);
       float frontDist = distanceCm[0];
+      // 斜め前方のSonar 1・2で左右の壁を検知する。
+      // 近い側から離れるよう操舵を補正し、最短距離が80cm以内なら減速、
+      // 20cm以内なら停止する。操舵補正は下のステアリング制御で行う。
       float leftDist = distanceCm[1];
       float rightDist = distanceCm[2];
 
@@ -323,15 +346,13 @@ void loop() {
   }
 
   unsigned long now = millis();
-  bool jetsonCommandFresh = hasJetsonSteeringCommand &&
-    now - lastJetsonSteeringCommandMs <= COMMAND_TIMEOUT_MS;
-  bool steeringInputFresh = useJetsonSteering
-    ? jetsonCommandFresh
+  bool steeringInputAvailable = useJetsonSteering
+    ? hasJetsonSteeringCommand
     : PS4.connected();
   int steeringUs = STEERING_CENTER_US;
 
   if (useJetsonSteering) {
-    if (jetsonCommandFresh) {
+    if (hasJetsonSteeringCommand) {
       if (jetsonSteeringValue <= STEERING_INPUT_CENTER) {
         steeringUs = map(
           jetsonSteeringValue,
@@ -356,8 +377,8 @@ void loop() {
       STEERING_CENTER_US + STEERING_RANGE_US);
   }
 
-  // 前進中はSonar 1・2で壁から離れる方向へステアリングを補正する。
-  if (steeringInputFresh && escUs < ESC_STOP_US) {
+  // 上記の斜めソナーで近い側を判定し、前進中は壁から離れる方向へ操舵する。
+  if (steeringInputAvailable && escUs < ESC_STOP_US) {
     float leftDist = distanceCm[1];  // Sonar 1 (左前45度)
     float rightDist = distanceCm[2]; // Sonar 2 (右前45度)
     float closestSideDist = min(leftDist, rightDist);
@@ -390,7 +411,9 @@ void loop() {
     lastTelemetryMs = now;
 
     int steeringOutputValue;
-    if (steeringUs <= STEERING_CENTER_US) {
+    if (useJetsonSteering && hasJetsonSteeringCommand) {
+      steeringOutputValue = jetsonSteeringValue;
+    } else if (steeringUs <= STEERING_CENTER_US) {
       steeringOutputValue = map(
         steeringUs,
         STEERING_CENTER_US - STEERING_RANGE_US, STEERING_CENTER_US,
