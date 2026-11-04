@@ -45,7 +45,10 @@
  * 
  * 【5. コントローラー・Jetsonとの入力】
  *  - スロットル : PS4コントローラーのR2/L2で操作
- *  - ステアリング入力切替 : PS4コントローラーの△ボタン
+ *  - △ボタン : 操舵元を切替、Sonar制御を有効化 (モード色は緑)
+ *  - □ボタン : Jetson操舵を選択、Sonar制御を無効化 (モード色は桃色)
+ *  - ×ボタン : 標準モード (PS4操舵・Sonar制御ON・標準色)
+ *  - ライトバー: モード色を維持。モード選択前は標準色 (青)
  *  - PS4接続    : USB Host Shield 2.0 (SPI: D9〜D13)
  *  - Jetson操舵 : USBシリアル、115200bps、ASCII、LF (\n) 終端
  *  - Jetson形式 : S<0〜255> (例: S127\n)。S<値>,T<値>形式も受信し、操舵値Sを使用
@@ -102,7 +105,10 @@ bool serialLineOverflow = false;
 int jetsonSteeringValue = STEERING_INPUT_CENTER;
 bool hasJetsonSteeringCommand = false;
 bool useJetsonSteering = false;
+bool sonarControlEnabled = true;
 unsigned long lastTelemetryMs = 0;
+uint8_t selectedLedMode = 0;
+uint8_t lastLedMode = 255;
 
 // ----------------------------------------------------------------------------
 // 4連超音波センサー (HC-SR04) 設定
@@ -299,6 +305,29 @@ void loop() {
   if (PS4.connected()) {
     if (PS4.getButtonClick(TRIANGLE)) {
       useJetsonSteering = !useJetsonSteering;
+      sonarControlEnabled = true;
+      selectedLedMode = 1;
+    }
+    if (PS4.getButtonClick(SQUARE)) {
+      useJetsonSteering = true;
+      sonarControlEnabled = false;
+      selectedLedMode = 2;
+    }
+    if (PS4.getButtonClick(CROSS)) {
+      useJetsonSteering = false;
+      sonarControlEnabled = true;
+      selectedLedMode = 0;
+    }
+
+    if (selectedLedMode != lastLedMode) {
+      if (selectedLedMode == 1) {
+        PS4.setLed(0, 255, 0);
+      } else if (selectedLedMode == 2) {
+        PS4.setLed(255, 0, 128);
+      } else {
+        PS4.setLed(Blue);
+      }
+      lastLedMode = selectedLedMode;
     }
 
     controllerSteeringValue = PS4.getAnalogHat(LeftHatX);
@@ -316,33 +345,40 @@ void loop() {
       float leftDist = distanceCm[1];
       float rightDist = distanceCm[2];
 
-      float frontScale = 1.0;
-      if (frontDist <= 20.0) {
-        frontScale = 0.0;
-      } else if (frontDist < 100.0) {
-        if (frontDist >= 50.0) {
-          frontScale = 0.5 + 0.5 * (frontDist - 50.0) / 50.0;
-        } else {
-          frontScale = 0.5 * (frontDist - 20.0) / 30.0;
+      if (sonarControlEnabled) {
+        float frontScale = 1.0;
+        if (frontDist <= 20.0) {
+          frontScale = 0.0;
+        } else if (frontDist < 100.0) {
+          if (frontDist >= 50.0) {
+            frontScale = 0.5 + 0.5 * (frontDist - 50.0) / 50.0;
+          } else {
+            frontScale = 0.5 * (frontDist - 20.0) / 30.0;
+          }
         }
-      }
 
-      float closestSideDist = min(leftDist, rightDist);
-      float sideScale = 1.0;
-      if (closestSideDist <= SIDE_WALL_STOP_DISTANCE_CM) {
-        sideScale = 0.0;
-      } else if (closestSideDist < SIDE_WALL_SLOW_DISTANCE_CM) {
-        sideScale = (closestSideDist - SIDE_WALL_STOP_DISTANCE_CM) /
-                    (SIDE_WALL_SLOW_DISTANCE_CM - SIDE_WALL_STOP_DISTANCE_CM);
-      }
+        float closestSideDist = min(leftDist, rightDist);
+        float sideScale = 1.0;
+        if (closestSideDist <= SIDE_WALL_STOP_DISTANCE_CM) {
+          sideScale = 0.0;
+        } else if (closestSideDist < SIDE_WALL_SLOW_DISTANCE_CM) {
+          sideScale = (closestSideDist - SIDE_WALL_STOP_DISTANCE_CM) /
+                      (SIDE_WALL_SLOW_DISTANCE_CM - SIDE_WALL_STOP_DISTANCE_CM);
+        }
 
-      int forwardDiff = ESC_STOP_US - baseEscUs;
-      escUs = ESC_STOP_US - (int)(forwardDiff * frontScale * sideScale);
+        int forwardDiff = ESC_STOP_US - baseEscUs;
+        escUs = ESC_STOP_US - (int)(forwardDiff * frontScale * sideScale);
+      } else {
+        escUs = baseEscUs;
+      }
     } else if (l2Val > 15) {
       escUs = map(
         l2Val, 0, 255,
         ESC_STOP_US, ESC_STOP_US + ESC_REVERSE_LIMIT_RANGE_US);
     }
+  } else {
+    // 再接続後も現在選択中のモード色をコントローラーへ再適用する。
+    lastLedMode = 255;
   }
 
   unsigned long now = millis();
@@ -378,7 +414,7 @@ void loop() {
   }
 
   // 上記の斜めソナーで近い側を判定し、前進中は壁から離れる方向へ操舵する。
-  if (steeringInputAvailable && escUs < ESC_STOP_US) {
+  if (sonarControlEnabled && steeringInputAvailable && escUs < ESC_STOP_US) {
     float leftDist = distanceCm[1];  // Sonar 1 (左前45度)
     float rightDist = distanceCm[2]; // Sonar 2 (右前45度)
     float closestSideDist = min(leftDist, rightDist);
