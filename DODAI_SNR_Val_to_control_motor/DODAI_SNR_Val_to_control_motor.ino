@@ -45,10 +45,11 @@
  * 
  * 【5. コントローラー・Jetsonとの入力】
  *  - スロットル : PS4コントローラーのR2/L2で操作
- *  - △ボタン : 操舵元を切替、Sonar制御を有効化 (モード色は緑)
- *  - □ボタン : Jetson操舵を選択、Sonar制御を無効化 (モード色は桃色)
- *  - ×ボタン : 標準モード (PS4操舵・Sonar制御ON・標準色)
- *  - ライトバー: モード色を維持。モード選択前は標準色 (青)
+ *  - ×ボタン : PS4操舵のみ、Sonar制御OFF (標準色)
+ *  - ○ボタン : PS4操舵、Sonar制御ON (赤色)
+ *  - □ボタン : Jetson操舵のみ、Sonar制御OFF (ピンク色)
+ *  - △ボタン : Jetson操舵、Sonar制御ON (緑色)
+ *  - ライトバー: 選択中のモード色を維持
  *  - PS4接続    : USB Host Shield 2.0 (SPI: D9〜D13)
  *  - Jetson操舵 : USBシリアル、115200bps、ASCII、LF (\n) 終端
  *  - Jetson形式 : S<0〜255> (例: S127\n)。S<値>,T<値>形式も受信し、操舵値Sを使用
@@ -303,24 +304,28 @@ void loop() {
   int escUs = ESC_STOP_US;
 
   if (PS4.connected()) {
-    if (PS4.getButtonClick(TRIANGLE)) {
-      useJetsonSteering = !useJetsonSteering;
+    if (PS4.getButtonClick(CROSS)) {
+      useJetsonSteering = false;
+      sonarControlEnabled = false;
+      selectedLedMode = 0;
+    } else if (PS4.getButtonClick(CIRCLE)) {
+      useJetsonSteering = false;
       sonarControlEnabled = true;
-      selectedLedMode = 1;
-    }
-    if (PS4.getButtonClick(SQUARE)) {
+      selectedLedMode = 3;
+    } else if (PS4.getButtonClick(SQUARE)) {
       useJetsonSteering = true;
       sonarControlEnabled = false;
       selectedLedMode = 2;
-    }
-    if (PS4.getButtonClick(CROSS)) {
-      useJetsonSteering = false;
+    } else if (PS4.getButtonClick(TRIANGLE)) {
+      useJetsonSteering = true;
       sonarControlEnabled = true;
-      selectedLedMode = 0;
+      selectedLedMode = 1;
     }
 
     if (selectedLedMode != lastLedMode) {
-      if (selectedLedMode == 1) {
+      if (selectedLedMode == 3) {
+        PS4.setLed(255, 0, 0);
+      } else if (selectedLedMode == 1) {
         PS4.setLed(0, 255, 0);
       } else if (selectedLedMode == 2) {
         PS4.setLed(255, 0, 128);
