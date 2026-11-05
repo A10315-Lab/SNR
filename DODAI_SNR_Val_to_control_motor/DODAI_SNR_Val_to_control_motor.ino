@@ -443,25 +443,16 @@ void loop() {
   }
 
   bool emergencySteering = false;
-  // Jetsonが壁側へ向かう時、または正面の壁へ直進する時は開けた側へ最大操舵する。
+  // Jetsonが左右ソナーで検知した壁側へ操舵する時、開けた側へ最大操舵する。
   // 横壁回避は自動前進中にも適用し、スロットル停止中も操舵を続ける。
   if (sonarControlEnabled &&
       steeringInputAvailable &&
       (autoThrottleEnabled || l2Val > 15)) {
-    float frontDist = distanceCm[0];
     float leftDist = distanceCm[1];  // Sonar 1 (左側)
     float rightDist = distanceCm[2]; // Sonar 2 (右側)
     float closestSideDist = min(leftDist, rightDist);
     bool leftSideOpen = leftDist > SIDE_WALL_CURVE_OPEN_DISTANCE_CM;
     bool rightSideOpen = rightDist > SIDE_WALL_CURVE_OPEN_DISTANCE_CM;
-    bool frontWallDetected =
-      frontDist >= 2.0 &&
-      frontDist <= FRONT_WALL_THROTTLE_LIMIT_DISTANCE_CM;
-    bool jetsonSteeringStraight =
-      useJetsonSteering &&
-      hasJetsonSteeringCommand &&
-      jetsonSteeringValue >= STEERING_INPUT_CENTER - DEADZONE &&
-      jetsonSteeringValue <= STEERING_INPUT_CENTER + DEADZONE;
     bool jetsonSteeringLeft =
       useJetsonSteering &&
       hasJetsonSteeringCommand &&
@@ -472,14 +463,12 @@ void loop() {
       jetsonSteeringValue > STEERING_INPUT_CENTER + DEADZONE;
 
     if (leftSideOpen && rightDist <= SIDE_WALL_CURVE_OPEN_DISTANCE_CM &&
-        (jetsonSteeringRight ||
-         (frontWallDetected && jetsonSteeringStraight))) {
+        jetsonSteeringRight) {
       steeringUs = STEERING_CENTER_US - STEERING_RANGE_US;
       emergencySteering = true;
     } else if (rightSideOpen &&
                leftDist <= SIDE_WALL_CURVE_OPEN_DISTANCE_CM &&
-               (jetsonSteeringLeft ||
-                (frontWallDetected && jetsonSteeringStraight))) {
+               jetsonSteeringLeft) {
       steeringUs = STEERING_CENTER_US + STEERING_RANGE_US;
       emergencySteering = true;
     } else if (closestSideDist < SIDE_WALL_SLOW_DISTANCE_CM &&
