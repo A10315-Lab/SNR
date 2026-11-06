@@ -44,10 +44,15 @@
  *             ESCのBEC電圧が5.0V仕様であることを確認した上でPCを抜いて5Vピンへ給電。
  * 
  * 【5. コントローラー・Jetsonとの入力】
- *  - スロットル : L2前進/R2後退で手動操作。OPTIONSで25%自動前進を切替
+ *  - スロットル : R2前進/L2後退で手動操作。OPTIONSで25%自動前進を切替
+ *  - 自動スロットル : 進行方向が80cm以上空き、距離変化が0.5秒停滞すると1秒間2倍
  *  - タッチパッド : 押すと自動スロットルを解除し、押している間は緊急停止
  *  - 正面200cm以内 : 前進上限30%、100cm以内 : 15%、15cm以内 : 停止
- *  - 横ソナー : スロットル制限なし。壁回避操舵に使用
+ *  - 横ソナー : スロットル制限なし。後進中以外の壁回避操舵に使用
+ *  - ソナー制御ON時、正面200cm以内で片側が開けていれば開けた側へ大操舵
+ *  - 大操舵終了 : 外側ソナーが30cm以上で増加中、操舵入力がデッドゾーン内
+ *                  かつ大操舵開始から1秒経過
+ *  - オフセット調整 : STEERING_OFFSET_US / THROTTLE_OFFSET_US を変更
  *  - ×ボタン : PS4操舵のみ、Sonar制御OFF (標準色)
  *  - ○ボタン : PS4操舵、Sonar制御ON (赤色)
  *  - □ボタン : Jetson操舵のみ、Sonar制御OFF (ピンク色)
@@ -82,16 +87,19 @@ Servo escServo;      // D6: ESC
 const int SERVO_PIN = 5; // ステアリング
 const int ESC_PIN   = 6; // ESC
 
-const int STEERING_CENTER_US = 1500;
-const int STEERING_RANGE_US  = 400; // 舵角範囲 (1200us ～ 1800us)
+const int STEERING_OFFSET_US = -40; // 正: 右操舵側 (パルス増加)、負: 左操舵側 (us)
+const int STEERING_CENTER_US = 1500 + STEERING_OFFSET_US;
+const int STEERING_RANGE_US  = 400; // 中立位置からの舵角範囲 (us)
 
-const int ESC_STOP_US  = 1500;
+const int THROTTLE_OFFSET_US = 10; // 正: 停止位置のパルスを増加 (us)
+const int ESC_STOP_US  = 1500 + THROTTLE_OFFSET_US;
+const int ESC_FORWARD_DIRECTION = 1; // +1: パルス増加で前進、-1: パルス減少で前進
 const int ESC_RANGE_US = 400;  // 出力範囲
 const int ESC_FORWARD_LIMIT_PERCENT = 100; // 前進の最大出力上限 (%)
 const int ESC_REVERSE_LIMIT_PERCENT = 100; // 後進の最大出力上限 (%)
-const int AUTO_THROTTLE_PERCENT = 25;
-const int FRONT_WALL_THROTTLE_LIMIT_PERCENT = 30;
-const int FRONT_WALL_NEAR_THROTTLE_LIMIT_PERCENT = 15;
+const int AUTO_THROTTLE_PERCENT = 20;
+const int FRONT_WALL_THROTTLE_LIMIT_PERCENT = 20;
+const int FRONT_WALL_NEAR_THROTTLE_LIMIT_PERCENT = 10;
 const int ESC_FORWARD_LIMIT_RANGE_US = ESC_RANGE_US * ESC_FORWARD_LIMIT_PERCENT / 100;
 const int ESC_REVERSE_LIMIT_RANGE_US = ESC_RANGE_US * ESC_REVERSE_LIMIT_PERCENT / 100;
 const int FRONT_WALL_THROTTLE_LIMIT_RANGE_US =
@@ -103,13 +111,29 @@ const int STEERING_INPUT_MIN = 0;
 const int STEERING_INPUT_MAX = 255;
 const int STEERING_INPUT_CENTER = 127;
 const int DEADZONE = 12;
-const float STEERING_FILTER_ALPHA = 0.1;
+const float STEERING_FILTER_ALPHA = 0.01;
 const float SIDE_WALL_CURVE_OPEN_DISTANCE_CM = 100.0;
 const float FRONT_WALL_THROTTLE_LIMIT_DISTANCE_CM = 200.0;
 const float FRONT_WALL_NEAR_THROTTLE_LIMIT_DISTANCE_CM = 100.0;
-const float SIDE_WALL_SLOW_DISTANCE_CM = 30.0;
-const float SIDE_WALL_STOP_DISTANCE_CM = 10.0;
-const int SIDE_WALL_STEERING_CORRECTION_US = 150;
+const float SIDE_WALL_CONTROL_START_DISTANCE_CM = 50.0;
+const float SIDE_WALL_CONTROL_START_AMOUNT_VALUE = 20.0;
+const float SIDE_WALL_CONTROL_MAX_AMOUNT_VALUE = 50.0;
+const float SIDE_WALL_CONTROL_MAX_AMOUNT_DISTANCE_CM = 10.0;
+const float SIDE_WALL_APPROACH_SPEED_FOR_MAX_CONTROL_CM_PER_SEC = 50.0;
+const float SIDE_WALL_APPROACH_SPEED_FILTER_ALPHA = 0.35;
+const float SIDE_WALL_LARGE_STEERING_END_DISTANCE_CM = 30.0;
+const float SIDE_WALL_LARGE_STEERING_END_MIN_RECEDING_SPEED_CM_PER_SEC = 2.0;
+const float SIDE_WALL_LARGE_STEERING_END_MIN_DISTANCE_INCREASE_CM = 2.0;
+const unsigned long SIDE_WALL_LARGE_STEERING_MIN_DURATION_MS = 1000;
+const float AUTO_THROTTLE_BOOST_CLEAR_DISTANCE_CM = 80.0;
+const float AUTO_THROTTLE_STALL_DISTANCE_TOLERANCE_CM = 2.0;
+const unsigned long AUTO_THROTTLE_STALL_DURATION_MS = 500;
+const float AUTO_THROTTLE_BOOST_MULTIPLIER = 2.0;
+const unsigned long AUTO_THROTTLE_BOOST_DURATION_MS = 1000;
+const int AUTO_THROTTLE_BOOST_TURN_THRESHOLD_US = 40;
+const uint8_t LARGE_STEERING_NONE = 0;
+const uint8_t LARGE_STEERING_LEFT = 1;
+const uint8_t LARGE_STEERING_RIGHT = 2;
 const unsigned long TELEMETRY_INTERVAL_MS = 50;
 const uint8_t SERIAL_LINE_BUFFER_SIZE = 16;
 
@@ -122,6 +146,11 @@ bool hasJetsonSteeringCommand = false;
 bool useJetsonSteering = false;
 bool sonarControlEnabled = true;
 bool autoThrottleEnabled = false;
+uint8_t completedLargeSteeringDirection = LARGE_STEERING_NONE;
+uint8_t activeLargeSteeringDirection = LARGE_STEERING_NONE;
+unsigned long largeSteeringStartedMs = 0;
+bool largeSteeringEndCheckArmed = false;
+float outerWallDistanceAtEndCheckCm = 999.0;
 float filteredSteeringUs = STEERING_CENTER_US;
 unsigned long lastTelemetryMs = 0;
 uint8_t selectedLedMode = 0;
@@ -143,6 +172,82 @@ volatile unsigned long echoDurationUs = 0;  // 計測されたパルス幅
 volatile bool echoReceived = false;         // 計測完了フラグ
 
 float distanceCm[NUM_SONARS] = {999.0, 999.0, 999.0, 999.0}; // 4つの距離データ(cm)
+float sonarStallReferenceDistanceCm[NUM_SONARS] = {999.0, 999.0, 999.0, 999.0};
+bool sonarStallReferenceInitialized[NUM_SONARS] = {false, false, false, false};
+bool sonarDistanceStalled[NUM_SONARS] = {false, false, false, false};
+unsigned long sonarDistanceUnchangedSinceMs[NUM_SONARS] = {0, 0, 0, 0};
+float previousSideDistanceCm[2] = {999.0, 999.0};
+float sideApproachSpeedCmPerSec[2] = {0.0, 0.0};
+float sideDistanceChangeCmPerSec[2] = {0.0, 0.0};
+unsigned long previousSideSampleMs[2] = {0, 0};
+uint8_t autoThrottleBoostConsumedMask = 0;
+bool autoThrottleBoostActive = false;
+uint8_t autoThrottleBoostSensorIndex = 0;
+unsigned long autoThrottleBoostStartedMs = 0;
+
+void updateSonarStallState(
+  uint8_t sonarIndex, float newDistanceCm, unsigned long sampleMs) {
+  if (!sonarStallReferenceInitialized[sonarIndex]) {
+    sonarStallReferenceDistanceCm[sonarIndex] = newDistanceCm;
+    sonarDistanceUnchangedSinceMs[sonarIndex] = sampleMs;
+    sonarStallReferenceInitialized[sonarIndex] = true;
+    sonarDistanceStalled[sonarIndex] = false;
+    return;
+  }
+
+  if (abs(newDistanceCm - sonarStallReferenceDistanceCm[sonarIndex]) >=
+      AUTO_THROTTLE_STALL_DISTANCE_TOLERANCE_CM) {
+    sonarStallReferenceDistanceCm[sonarIndex] = newDistanceCm;
+    sonarDistanceUnchangedSinceMs[sonarIndex] = sampleMs;
+    sonarDistanceStalled[sonarIndex] = false;
+    return;
+  }
+
+  sonarDistanceStalled[sonarIndex] =
+    sampleMs - sonarDistanceUnchangedSinceMs[sonarIndex] >=
+    AUTO_THROTTLE_STALL_DURATION_MS;
+}
+
+void updateSideApproachSpeed(
+  uint8_t sonarIndex, float newDistanceCm, bool valid, unsigned long sampleMs) {
+  uint8_t sideIndex = sonarIndex - 1;
+  if (!valid) {
+    previousSideDistanceCm[sideIndex] = 999.0;
+    previousSideSampleMs[sideIndex] = 0;
+    sideApproachSpeedCmPerSec[sideIndex] = 0.0;
+    sideDistanceChangeCmPerSec[sideIndex] = 0.0;
+    return;
+  }
+
+  unsigned long elapsedMs = sampleMs - previousSideSampleMs[sideIndex];
+  if (previousSideSampleMs[sideIndex] != 0 &&
+      previousSideDistanceCm[sideIndex] <= 450.0 &&
+      elapsedMs > 0 &&
+      elapsedMs <= 500) {
+    float measuredApproachSpeed =
+      (previousSideDistanceCm[sideIndex] - newDistanceCm) *
+      1000.0 / elapsedMs;
+    measuredApproachSpeed = constrain(measuredApproachSpeed, 0.0, 1000.0);
+    float measuredDistanceChange =
+      (newDistanceCm - previousSideDistanceCm[sideIndex]) *
+      1000.0 / elapsedMs;
+    measuredDistanceChange = constrain(
+      measuredDistanceChange, -1000.0, 1000.0);
+    sideApproachSpeedCmPerSec[sideIndex] +=
+      (measuredApproachSpeed - sideApproachSpeedCmPerSec[sideIndex]) *
+      SIDE_WALL_APPROACH_SPEED_FILTER_ALPHA;
+    sideDistanceChangeCmPerSec[sideIndex] +=
+      (measuredDistanceChange -
+       sideDistanceChangeCmPerSec[sideIndex]) *
+      SIDE_WALL_APPROACH_SPEED_FILTER_ALPHA;
+  } else {
+    sideApproachSpeedCmPerSec[sideIndex] = 0.0;
+    sideDistanceChangeCmPerSec[sideIndex] = 0.0;
+  }
+
+  previousSideDistanceCm[sideIndex] = newDistanceCm;
+  previousSideSampleMs[sideIndex] = sampleMs;
+}
 
 // ----------------------------------------------------------------------------
 // ピン変化割り込み (PORTC: A0〜A3 のいずれかが変化した時に自動で呼ばれる)
@@ -171,6 +276,9 @@ void updateMultiSonar() {
   // 30ms経過するごとに「前センサーの結果回収」と「次センサーのトリガー発射」を行う
   if (now - lastSonarSwitchTime >= SONAR_INTERVAL_MS) {
     lastSonarSwitchTime = now;
+    uint8_t measuredSonar = currentSonar;
+    float measuredDistanceCm = 999.0;
+    bool measurementValid = false;
 
     // 1. 直前に鳴らしたセンサーの結果を回収
     if (echoReceived) {
@@ -181,13 +289,16 @@ void updateMultiSonar() {
 
       float tempCm = (float)dur * 0.01715; // 距離(cm)に変換
       if (tempCm >= 2.0 && tempCm <= 450.0) {
-        distanceCm[currentSonar] = tempCm;
-      } else {
-        distanceCm[currentSonar] = 999.0;
+        measuredDistanceCm = tempCm;
+        measurementValid = true;
       }
-    } else {
-      // 30ms以内にEchoが返ってこなかった場合（タイムアウト・範囲外）
-      distanceCm[currentSonar] = 999.0;
+    }
+    // Echoなしまたは範囲外は999cmとして扱う。
+    distanceCm[measuredSonar] = measuredDistanceCm;
+    updateSonarStallState(measuredSonar, measuredDistanceCm, now);
+    if (measuredSonar == 1 || measuredSonar == 2) {
+      updateSideApproachSpeed(
+        measuredSonar, measuredDistanceCm, measurementValid, now);
     }
 
     // 2. 計測するセンサーを次の番号 (0 -> 1 -> 2 -> 3 -> 0...) に切り替え
@@ -317,6 +428,7 @@ void loop() {
   uint8_t controllerSteeringValue = STEERING_INPUT_CENTER;
   uint8_t r2Val = 0;
   uint8_t l2Val = 0;
+  bool reverseThrottleRequested = false;
   int escUs = ESC_STOP_US;
 
   if (PS4.connected()) {
@@ -362,17 +474,23 @@ void loop() {
     controllerSteeringValue = PS4.getAnalogHat(LeftHatX);
     r2Val = PS4.getAnalogButton(R2);
     l2Val = PS4.getAnalogButton(L2);
+    reverseThrottleRequested =
+      !autoThrottleEnabled && r2Val <= 15 && l2Val > 15;
 
     int baseEscUs = ESC_STOP_US;
     bool forwardThrottleRequested = false;
+    int throttleDirection = ESC_FORWARD_DIRECTION;
     if (autoThrottleEnabled) {
-      baseEscUs = ESC_STOP_US -
-        ESC_RANGE_US * AUTO_THROTTLE_PERCENT / 100;
+      // 実機でR2前進と方向が逆になるため、自動スロットルのみ反転する。
+      throttleDirection = -ESC_FORWARD_DIRECTION;
+      baseEscUs = ESC_STOP_US +
+        throttleDirection * ESC_RANGE_US * AUTO_THROTTLE_PERCENT / 100;
       forwardThrottleRequested = true;
-    } else if (l2Val > 15) {
+    } else if (r2Val > 15) {
       baseEscUs = map(
-        l2Val, 0, 255,
-        ESC_STOP_US, ESC_STOP_US - ESC_FORWARD_LIMIT_RANGE_US);
+        r2Val, 0, 255,
+        ESC_STOP_US,
+        ESC_STOP_US + ESC_FORWARD_DIRECTION * ESC_FORWARD_LIMIT_RANGE_US);
       forwardThrottleRequested = true;
     }
 
@@ -383,7 +501,8 @@ void loop() {
         if (frontDist >= 2.0 && frontDist <= 15.0) {
           escUs = ESC_STOP_US;
         } else {
-          int forwardDiff = ESC_STOP_US - baseEscUs;
+          int forwardDiff =
+            (baseEscUs - ESC_STOP_US) * throttleDirection;
           if (frontDist >= 2.0 &&
               frontDist <= FRONT_WALL_THROTTLE_LIMIT_DISTANCE_CM) {
             forwardDiff = min(
@@ -394,15 +513,17 @@ void loop() {
             forwardDiff = min(
               forwardDiff, FRONT_WALL_NEAR_THROTTLE_LIMIT_RANGE_US);
           }
-          escUs = ESC_STOP_US - forwardDiff;
+          escUs =
+            ESC_STOP_US + throttleDirection * forwardDiff;
         }
       } else {
         escUs = baseEscUs;
       }
-    } else if (!autoThrottleEnabled && r2Val > 15) {
+    } else if (reverseThrottleRequested) {
       escUs = map(
-        r2Val, 0, 255,
-        ESC_STOP_US, ESC_STOP_US + ESC_REVERSE_LIMIT_RANGE_US);
+        l2Val, 0, 255,
+        ESC_STOP_US,
+        ESC_STOP_US - ESC_FORWARD_DIRECTION * ESC_REVERSE_LIMIT_RANGE_US);
     }
   } else {
     // 再接続後も現在選択中のモード色をコントローラーへ再適用する。
@@ -414,10 +535,20 @@ void loop() {
   bool steeringInputAvailable = useJetsonSteering
     ? hasJetsonSteeringCommand
     : PS4.connected();
+  if (!sonarControlEnabled ||
+      !steeringInputAvailable ||
+      reverseThrottleRequested) {
+    completedLargeSteeringDirection = LARGE_STEERING_NONE;
+    activeLargeSteeringDirection = LARGE_STEERING_NONE;
+    largeSteeringEndCheckArmed = false;
+  }
   int steeringUs = STEERING_CENTER_US;
+  int steeringInputDelta = 0;
 
   if (useJetsonSteering) {
     if (hasJetsonSteeringCommand) {
+      steeringInputDelta =
+        abs(jetsonSteeringValue - STEERING_INPUT_CENTER);
       if (jetsonSteeringValue <= STEERING_INPUT_CENTER) {
         steeringUs = map(
           jetsonSteeringValue,
@@ -435,6 +566,8 @@ void loop() {
   } else if (PS4.connected() &&
              (controllerSteeringValue < STEERING_INPUT_CENTER - DEADZONE ||
               controllerSteeringValue > STEERING_INPUT_CENTER + DEADZONE)) {
+    steeringInputDelta =
+      abs((int)controllerSteeringValue - STEERING_INPUT_CENTER);
     steeringUs = map(
       controllerSteeringValue,
       STEERING_INPUT_MIN, STEERING_INPUT_MAX,
@@ -442,51 +575,161 @@ void loop() {
       STEERING_CENTER_US + STEERING_RANGE_US);
   }
 
-  bool emergencySteering = false;
-  // Jetsonが左右ソナーで検知した壁側へ操舵する時、開けた側へ最大操舵する。
-  // 横壁回避は自動前進中にも適用し、スロットル停止中も操舵を続ける。
+  // 後進中を除き、前方に壁があれば開けた側へ大操舵し、横壁は通常回避する。
+  // 横壁回避と大操舵は、通常操舵と同じローパスフィルターを通す。
   if (sonarControlEnabled &&
       steeringInputAvailable &&
-      (autoThrottleEnabled || l2Val > 15)) {
+      !reverseThrottleRequested) {
+    float frontDist = distanceCm[0];
     float leftDist = distanceCm[1];  // Sonar 1 (左側)
     float rightDist = distanceCm[2]; // Sonar 2 (右側)
     float closestSideDist = min(leftDist, rightDist);
+    bool frontWallDetected =
+      frontDist >= 2.0 &&
+      frontDist <= FRONT_WALL_THROTTLE_LIMIT_DISTANCE_CM;
     bool leftSideOpen = leftDist > SIDE_WALL_CURVE_OPEN_DISTANCE_CM;
     bool rightSideOpen = rightDist > SIDE_WALL_CURVE_OPEN_DISTANCE_CM;
-    bool jetsonSteeringLeft =
-      useJetsonSteering &&
-      hasJetsonSteeringCommand &&
-      jetsonSteeringValue < STEERING_INPUT_CENTER - DEADZONE;
-    bool jetsonSteeringRight =
-      useJetsonSteering &&
-      hasJetsonSteeringCommand &&
-      jetsonSteeringValue > STEERING_INPUT_CENTER + DEADZONE;
+    uint8_t largeSteeringDirection = LARGE_STEERING_NONE;
+    if (frontWallDetected &&
+        leftSideOpen &&
+        rightDist <= SIDE_WALL_CURVE_OPEN_DISTANCE_CM) {
+      largeSteeringDirection = LARGE_STEERING_LEFT;
+    } else if (frontWallDetected &&
+               rightSideOpen &&
+               leftDist <= SIDE_WALL_CURVE_OPEN_DISTANCE_CM) {
+      largeSteeringDirection = LARGE_STEERING_RIGHT;
+    }
 
-    if (leftSideOpen && rightDist <= SIDE_WALL_CURVE_OPEN_DISTANCE_CM &&
-        jetsonSteeringRight) {
+    if (largeSteeringDirection != activeLargeSteeringDirection) {
+      activeLargeSteeringDirection = largeSteeringDirection;
+      completedLargeSteeringDirection = LARGE_STEERING_NONE;
+      largeSteeringStartedMs = now;
+      largeSteeringEndCheckArmed = false;
+    }
+    if (largeSteeringDirection != LARGE_STEERING_NONE &&
+        completedLargeSteeringDirection == LARGE_STEERING_NONE) {
+      uint8_t outerWallIndex =
+        largeSteeringDirection == LARGE_STEERING_LEFT ? 1 : 0;
+      float outerWallDistance = distanceCm[outerWallIndex + 1];
+      if (!largeSteeringEndCheckArmed &&
+          now - largeSteeringStartedMs >=
+            SIDE_WALL_LARGE_STEERING_MIN_DURATION_MS) {
+        outerWallDistanceAtEndCheckCm = outerWallDistance;
+        largeSteeringEndCheckArmed = true;
+      }
+      if (largeSteeringEndCheckArmed &&
+          outerWallDistance >=
+            SIDE_WALL_LARGE_STEERING_END_DISTANCE_CM &&
+          sideDistanceChangeCmPerSec[outerWallIndex] >=
+            SIDE_WALL_LARGE_STEERING_END_MIN_RECEDING_SPEED_CM_PER_SEC &&
+          outerWallDistance >= outerWallDistanceAtEndCheckCm +
+            SIDE_WALL_LARGE_STEERING_END_MIN_DISTANCE_INCREASE_CM &&
+          steeringInputDelta <= DEADZONE) {
+        completedLargeSteeringDirection = largeSteeringDirection;
+      }
+    }
+
+    if (largeSteeringDirection == LARGE_STEERING_LEFT &&
+        completedLargeSteeringDirection != LARGE_STEERING_LEFT) {
       steeringUs = STEERING_CENTER_US - STEERING_RANGE_US;
-      emergencySteering = true;
-    } else if (rightSideOpen &&
-               leftDist <= SIDE_WALL_CURVE_OPEN_DISTANCE_CM &&
-               jetsonSteeringLeft) {
+    } else if (largeSteeringDirection == LARGE_STEERING_RIGHT &&
+               completedLargeSteeringDirection != LARGE_STEERING_RIGHT) {
       steeringUs = STEERING_CENTER_US + STEERING_RANGE_US;
-      emergencySteering = true;
-    } else if (closestSideDist < SIDE_WALL_SLOW_DISTANCE_CM &&
-               leftDist != rightDist) {
-      float avoidanceScale = constrain(
-        (SIDE_WALL_SLOW_DISTANCE_CM - closestSideDist) /
-          (SIDE_WALL_SLOW_DISTANCE_CM - SIDE_WALL_STOP_DISTANCE_CM),
-        0.0, 1.0);
-      int avoidanceCorrection =
-        (int)(avoidanceScale * SIDE_WALL_STEERING_CORRECTION_US);
+    } else if (leftDist != rightDist && closestSideDist <= 450.0) {
+      uint8_t closestSideIndex = leftDist < rightDist ? 0 : 1;
+      float approachSpeed = sideApproachSpeedCmPerSec[closestSideIndex];
+      bool steeringAwayFromClosestWall = leftDist < rightDist
+        ? steeringUs > STEERING_CENTER_US
+        : steeringUs < STEERING_CENTER_US;
 
-      steeringUs += leftDist < rightDist
-        ? avoidanceCorrection
-        : -avoidanceCorrection;
-      steeringUs = constrain(
-        steeringUs,
-        STEERING_CENTER_US - STEERING_RANGE_US,
-        STEERING_CENTER_US + STEERING_RANGE_US);
+      if (!steeringAwayFromClosestWall &&
+          (closestSideDist <= SIDE_WALL_CONTROL_START_DISTANCE_CM ||
+           approachSpeed > 0.0)) {
+        float avoidanceAmountValue = SIDE_WALL_CONTROL_START_AMOUNT_VALUE;
+        if (closestSideDist <=
+            SIDE_WALL_CONTROL_MAX_AMOUNT_DISTANCE_CM) {
+          avoidanceAmountValue = SIDE_WALL_CONTROL_MAX_AMOUNT_VALUE;
+        } else if (closestSideDist <
+                   SIDE_WALL_CONTROL_START_DISTANCE_CM) {
+          avoidanceAmountValue = SIDE_WALL_CONTROL_START_AMOUNT_VALUE +
+              (SIDE_WALL_CONTROL_MAX_AMOUNT_VALUE -
+               SIDE_WALL_CONTROL_START_AMOUNT_VALUE) *
+              (SIDE_WALL_CONTROL_START_DISTANCE_CM - closestSideDist) /
+              (SIDE_WALL_CONTROL_START_DISTANCE_CM -
+               SIDE_WALL_CONTROL_MAX_AMOUNT_DISTANCE_CM);
+        }
+        float approachSpeedGain = constrain(
+          approachSpeed /
+            SIDE_WALL_APPROACH_SPEED_FOR_MAX_CONTROL_CM_PER_SEC,
+          0.0, 1.0);
+        int avoidanceCorrection = (int)(
+          avoidanceAmountValue * approachSpeedGain * STEERING_RANGE_US * 2 /
+          (STEERING_INPUT_MAX - STEERING_INPUT_MIN));
+
+        steeringUs += leftDist < rightDist
+          ? avoidanceCorrection
+          : -avoidanceCorrection;
+        steeringUs = constrain(
+          steeringUs,
+          STEERING_CENTER_US - STEERING_RANGE_US,
+          STEERING_CENTER_US + STEERING_RANGE_US);
+      }
+    }
+  }
+
+  if (!autoThrottleEnabled) {
+    autoThrottleBoostActive = false;
+    autoThrottleBoostConsumedMask = 0;
+  } else {
+    bool steeringLeft =
+      steeringUs < STEERING_CENTER_US - AUTO_THROTTLE_BOOST_TURN_THRESHOLD_US;
+    bool steeringRight =
+      steeringUs > STEERING_CENTER_US + AUTO_THROTTLE_BOOST_TURN_THRESHOLD_US;
+    uint8_t progressSonarIndex = 0;
+    bool pathClear =
+      distanceCm[0] > AUTO_THROTTLE_BOOST_CLEAR_DISTANCE_CM;
+    if (steeringLeft) {
+      progressSonarIndex = 1;
+      pathClear = pathClear &&
+        distanceCm[progressSonarIndex] >
+          AUTO_THROTTLE_BOOST_CLEAR_DISTANCE_CM;
+    } else if (steeringRight) {
+      progressSonarIndex = 2;
+      pathClear = pathClear &&
+        distanceCm[progressSonarIndex] >
+          AUTO_THROTTLE_BOOST_CLEAR_DISTANCE_CM;
+    }
+
+    uint8_t progressSensorMask = (1 << progressSonarIndex);
+    if (!sonarDistanceStalled[progressSonarIndex] || !pathClear) {
+      autoThrottleBoostConsumedMask &= ~progressSensorMask;
+    }
+    if (!pathClear ||
+        (autoThrottleBoostActive &&
+         autoThrottleBoostSensorIndex != progressSonarIndex)) {
+      autoThrottleBoostActive = false;
+    }
+    if (autoThrottleBoostActive &&
+        now - autoThrottleBoostStartedMs >=
+          AUTO_THROTTLE_BOOST_DURATION_MS) {
+      autoThrottleBoostActive = false;
+    }
+    if (pathClear &&
+        sonarDistanceStalled[progressSonarIndex] &&
+        (autoThrottleBoostConsumedMask & progressSensorMask) == 0) {
+      autoThrottleBoostActive = true;
+      autoThrottleBoostSensorIndex = progressSonarIndex;
+      autoThrottleBoostStartedMs = now;
+      autoThrottleBoostConsumedMask |= progressSensorMask;
+    }
+    if (autoThrottleBoostActive) {
+      int throttleOffset = escUs - ESC_STOP_US;
+      int boostedThrottleOffset = (int)(
+        throttleOffset * AUTO_THROTTLE_BOOST_MULTIPLIER);
+      escUs = constrain(
+        ESC_STOP_US + boostedThrottleOffset,
+        ESC_STOP_US - ESC_REVERSE_LIMIT_RANGE_US,
+        ESC_STOP_US + ESC_FORWARD_LIMIT_RANGE_US);
     }
   }
 
@@ -496,13 +739,9 @@ void loop() {
     escUs = ESC_STOP_US;
   }
 
-  if (emergencySteering) {
-    filteredSteeringUs = steeringUs;
-  } else {
-    filteredSteeringUs +=
-      (steeringUs - filteredSteeringUs) * STEERING_FILTER_ALPHA;
-    steeringUs = (int)filteredSteeringUs;
-  }
+  filteredSteeringUs +=
+    (steeringUs - filteredSteeringUs) * STEERING_FILTER_ALPHA;
+  steeringUs = (int)filteredSteeringUs;
 
   steeringServo.writeMicroseconds(steeringUs);
   escServo.writeMicroseconds(escUs);
@@ -526,16 +765,18 @@ void loop() {
         STEERING_INPUT_CENTER, STEERING_INPUT_MAX);
     }
 
+    int throttleDirectionAdjusted =
+      (escUs - ESC_STOP_US) * ESC_FORWARD_DIRECTION;
     int throttleOutputValue = 0;
-    if (escUs < ESC_STOP_US) {
+    if (throttleDirectionAdjusted > 0) {
       throttleOutputValue = map(
-        escUs,
-        ESC_STOP_US, ESC_STOP_US - ESC_FORWARD_LIMIT_RANGE_US,
+        throttleDirectionAdjusted,
+        0, ESC_FORWARD_LIMIT_RANGE_US,
         0, 255);
-    } else if (escUs > ESC_STOP_US) {
+    } else if (throttleDirectionAdjusted < 0) {
       throttleOutputValue = map(
-        escUs,
-        ESC_STOP_US, ESC_STOP_US + ESC_REVERSE_LIMIT_RANGE_US,
+        -throttleDirectionAdjusted,
+        0, ESC_REVERSE_LIMIT_RANGE_US,
         0, -255);
     }
 
